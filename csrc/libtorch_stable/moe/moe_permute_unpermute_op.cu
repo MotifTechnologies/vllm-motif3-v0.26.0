@@ -69,7 +69,8 @@ void moe_permute_impl(
     const std::optional<torch::stable::Tensor>& maybe_sort_workspace,
     const std::optional<torch::stable::Tensor>& maybe_permuted_experts_id,
     const std::optional<torch::stable::Tensor>& maybe_sorted_row_idx,
-    const std::optional<torch::stable::Tensor>& maybe_topk_ids_for_sort) {
+    const std::optional<torch::stable::Tensor>& maybe_topk_ids_for_sort,
+    bool skip_input_permute) {
   STD_TORCH_CHECK(expert_first_token_offset.scalar_type() ==
                       torch::headeronly::ScalarType::Long,
                   "expert_first_token_offset must be int64");
@@ -83,9 +84,14 @@ void moe_permute_impl(
       "inv_permuted_idx must be int32");
   STD_TORCH_CHECK(expert_first_token_offset.size(0) == n_local_expert + 1,
                   "expert_first_token_offset shape != n_local_expert+1");
-  STD_TORCH_CHECK(
-      inv_permuted_idx.sizes().equals(token_expert_indices.sizes()),
-      "token_expert_indices shape must be same as inv_permuted_idx");
+  if (token_expert_indices.numel() == 0) {
+    STD_TORCH_CHECK(skip_input_permute,
+                    "empty source rows require map-only permutation");
+  } else {
+    STD_TORCH_CHECK(
+        inv_permuted_idx.sizes().equals(token_expert_indices.sizes()),
+        "token_expert_indices shape must be same as inv_permuted_idx");
+  }
 
   const torch::stable::accelerator::DeviceGuard device_guard(
       input.get_device_index());
@@ -95,6 +101,21 @@ void moe_permute_impl(
   auto expanded_rows = n_token * topk;
   auto stream = get_current_cuda_stream(input.get_device_index());
 
+  if (skip_input_permute && token_expert_indices.numel() == 0) {
+    // MOTIF: decode-sized map-only routing — the fused NVFP4 quantizer
+    // gathers rows itself, so only the source-row map and per-expert
+    // offsets are produced here.
+    const int* expert_map_ptr = expert_map.has_value()
+                                    ? get_ptr<const int>(expert_map.value())
+                                    : nullptr;
+    stableMapOnlyExpertSortLauncher(
+        get_ptr<const int>(topk_ids), expert_map_ptr,
+        get_ptr<int>(permuted_idx),
+        get_ptr<int64_t>(expert_first_token_offset), n_token, n_expert,
+        n_local_expert, topk, stream);
+    return;
+  }
+
   auto sorter_size = moe_permute_sort_workspace_size(expanded_rows, n_expert);
   auto sort_workspace = maybe_allocate_tensor(
       maybe_sort_workspace, {sorter_size}, torch::headeronly::ScalarType::Char,
@@ -102,9 +123,15 @@ void moe_permute_impl(
   auto permuted_experts_id = maybe_allocate_tensor(
       maybe_permuted_experts_id, topk_ids.sizes(),
       torch::headeronly::ScalarType::Int, device, "permuted_experts_id");
-  auto sorted_row_idx = maybe_allocate_tensor(
-      maybe_sorted_row_idx, inv_permuted_idx.sizes(),
-      torch::headeronly::ScalarType::Int, device, "sorted_row_idx");
+  // MOTIF: the fused NVFP4 path consumes the sorted source-row map directly
+  // in its first quantizer; write the sort output straight into permuted_idx.
+  auto sorted_row_idx =
+      skip_input_permute
+          ? permuted_idx
+          : maybe_allocate_tensor(maybe_sorted_row_idx,
+                                  inv_permuted_idx.sizes(),
+                                  torch::headeronly::ScalarType::Int, device,
+                                  "sorted_row_idx");
 
   CubKeyValueSorter sorter{};
   int64_t* valid_num_ptr = nullptr;
@@ -128,6 +155,11 @@ void moe_permute_impl(
       get_ptr<int64_t>(expert_first_token_offset), n_token, n_expert,
       n_local_expert, topk, sorter, get_ptr<int>(sort_workspace), stream);
 
+  if (skip_input_permute) {
+    // MOTIF: no materialized permuted input; inv_permuted_idx is filled by
+    // the fused quantizer (pre-filled with its skip sentinel by the caller).
+    return;
+  }
   MOE_DISPATCH(input.scalar_type(), [&] {
     expandInputRowsKernelLauncher<scalar_t>(
         get_ptr<scalar_t>(input), get_ptr<scalar_t>(permuted_input),
@@ -146,11 +178,13 @@ void moe_permute(
     torch::stable::Tensor& permuted_input,  // [permuted_size, hidden]
     torch::stable::Tensor& expert_first_token_offset,  // [n_local_expert + 1]
     torch::stable::Tensor& inv_permuted_idx,           // [n_token, topk]
-    torch::stable::Tensor& permuted_idx) {             // [permute_size]
+    torch::stable::Tensor& permuted_idx,               // [permute_size]
+    bool skip_input_permute) {
   moe_permute_impl(input, topk_ids, token_expert_indices, expert_map, n_expert,
                    n_local_expert, topk, permuted_input,
                    expert_first_token_offset, inv_permuted_idx, permuted_idx,
-                   std::nullopt, std::nullopt, std::nullopt, std::nullopt);
+                   std::nullopt, std::nullopt, std::nullopt, std::nullopt,
+                   skip_input_permute);
 }
 
 void moe_permute_with_scratch(
@@ -168,7 +202,7 @@ void moe_permute_with_scratch(
                    n_local_expert, topk, permuted_input,
                    expert_first_token_offset, inv_permuted_idx, permuted_idx,
                    sort_workspace, permuted_experts_id, sorted_row_idx,
-                   topk_ids_for_sort);
+                   topk_ids_for_sort, false);
 }
 
 void moe_unpermute(

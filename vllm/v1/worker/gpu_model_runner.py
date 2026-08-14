@@ -5778,6 +5778,7 @@ class GPUModelRunner(
         is_graph_capturing: bool = False,
         num_active_loras: int = 0,
         profile_seq_lens: int | None = None,
+        is_dp_idle_sync: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Run a dummy forward pass to warm up/profile run or capture the
@@ -6132,12 +6133,22 @@ class GPUModelRunner(
                 ):
                     use_cudagraphs = False
 
-                self.drafter.dummy_run(
-                    num_tokens,
-                    use_cudagraphs=use_cudagraphs,
-                    is_graph_capturing=is_graph_capturing,
-                    slot_mappings=slot_mappings,
-                )
+                # MOTIF: when the dense drafter skips DP batch coordination,
+                # idle-rank per-step dummies have no drafter collective to
+                # pair with, so their draft forwards are pure waste — skip
+                # them so idle ranks reach the next step's main-model
+                # rendezvous sooner. Startup warmup/capture paths (and MoE
+                # drafters, which still coordinate) keep running.
+                if not (
+                    is_dp_idle_sync
+                    and getattr(self.drafter, "skip_draft_dp_coordination", False)
+                ):
+                    self.drafter.dummy_run(
+                        num_tokens,
+                        use_cudagraphs=use_cudagraphs,
+                        is_graph_capturing=is_graph_capturing,
+                        slot_mappings=slot_mappings,
+                    )
 
         # We register layerwise NVTX hooks here after the first dynamo tracing is
         # done to avoid nvtx operations in hook functions being traced by

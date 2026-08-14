@@ -104,6 +104,10 @@ _REASONING_PARSERS_TO_REGISTER = {
         "mistral_reasoning_parser",
         "MistralReasoningParser",
     ),
+    "motif": (
+        "motif_reasoning_parser",
+        "MotifReasoningParser",
+    ),
     "nemotron_v3": (
         "nemotron_v3_engine_reasoning_parser",
         "NemotronV3ParserReasoningAdapter",

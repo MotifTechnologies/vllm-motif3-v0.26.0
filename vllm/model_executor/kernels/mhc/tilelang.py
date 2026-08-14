@@ -100,6 +100,7 @@ def mhc_pre_tilelang(
     n_splits: int = 1,
     norm_weight: torch.Tensor | None = None,
     norm_eps: float = 1e-6,
+    motif_sinkhorn: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Forward pass for mHC pre block.
@@ -120,6 +121,10 @@ def mhc_pre_tilelang(
             layer_input write path of the big_fuse kernel.
         norm_eps: epsilon for the fused RMSNorm; only consulted when
             norm_weight is given.
+        motif_sinkhorn: 1 selects motif3's training-time sinkhorn convention
+            (exp(clamp(M, +-20)) init, clamp-min(eps) denominators, comb_mix
+            stored transposed). Only supported on the no-norm path, since
+            motif3 does not fuse an RMSNorm into the pre block.
 
     Returns:
         post_mix: shape (..., hc_mult), dtype torch.float32
@@ -227,8 +232,12 @@ def mhc_pre_tilelang(
             sinkhorn_repeat,
             n_splits,
             hc_mult,
+            motif_sinkhorn,
         )
     else:
+        assert not motif_sinkhorn, (
+            "motif_sinkhorn is only implemented on the no-norm mhc_pre path"
+        )
         mhc_pre_big_fuse_with_norm_tilelang(
             gemm_out_mul,
             gemm_out_sqrsum,
@@ -270,6 +279,7 @@ def _mhc_pre_tilelang_fake(
     n_splits: int = 1,
     norm_weight: torch.Tensor | None = None,
     norm_eps: float = 1e-6,
+    motif_sinkhorn: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     hc_mult = residual.shape[-2]
     hidden_size = residual.shape[-1]

@@ -25,8 +25,8 @@ nvtx==0.2.15
 fastsafetensors >= 0.3.2
 
 # QuACK and Cutlass DSL for FA4 (cute-DSL implementation)
-nvidia-cutlass-dsl[cu13]==4.6.0
-quack-kernels>=0.4.0  # Required for tml-fa4
+nvidia-cutlass-dsl[cu13]==4.7.0
+quack-kernels>=0.6.4  # measured pair with cutlass-dsl 4.7.0; the cutlass tree is owned by nvidia-cutlass-dsl-libs-*, so upgrades must NOT use --no-deps
 
 # Tokenspeed_MLA for faster mla with spec decode
 tokenspeed-mla==0.1.8; platform_system == "Linux"

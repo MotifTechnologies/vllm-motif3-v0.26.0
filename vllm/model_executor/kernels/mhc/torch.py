@@ -14,6 +14,7 @@ def mhc_pre_torch(
     hc_post_mult_value: float,
     sinkhorn_repeat: int,
     n_splits: int = 1,
+    motif_sinkhorn: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Forward pass for mHC pre block.
@@ -75,11 +76,26 @@ def mhc_pre_torch(
     comb_logits = mixes[:, 2 * hc_mult :].view(num_tokens, hc_mult, hc_mult) * hc_scale[
         2
     ] + hc_base[2 * hc_mult :].view(1, hc_mult, hc_mult)
-    comb_mix = torch.softmax(comb_logits, dim=-1) + hc_sinkhorn_eps
-    comb_mix = comb_mix / (comb_mix.sum(dim=-2, keepdim=True) + hc_sinkhorn_eps)
-    for _ in range(sinkhorn_repeat - 1):
-        comb_mix = comb_mix / (comb_mix.sum(dim=-1, keepdim=True) + hc_sinkhorn_eps)
+    if motif_sinkhorn:
+        # motif3 training convention: exp(clamp(M, +-20)) init, then
+        # `sinkhorn_repeat` full (row, col) passes with clamp-min(eps)
+        # denominators, and comb_mix returned transposed so that the consumer's
+        # comb^T application yields sinkhorn(M).
+        comb_mix = torch.exp(comb_logits.clamp(-20.0, 20.0))
+        for _ in range(sinkhorn_repeat):
+            comb_mix = comb_mix / comb_mix.sum(dim=-1, keepdim=True).clamp_min(
+                hc_sinkhorn_eps
+            )
+            comb_mix = comb_mix / comb_mix.sum(dim=-2, keepdim=True).clamp_min(
+                hc_sinkhorn_eps
+            )
+        comb_mix = comb_mix.transpose(-1, -2).contiguous()
+    else:
+        comb_mix = torch.softmax(comb_logits, dim=-1) + hc_sinkhorn_eps
         comb_mix = comb_mix / (comb_mix.sum(dim=-2, keepdim=True) + hc_sinkhorn_eps)
+        for _ in range(sinkhorn_repeat - 1):
+            comb_mix = comb_mix / (comb_mix.sum(dim=-1, keepdim=True) + hc_sinkhorn_eps)
+            comb_mix = comb_mix / (comb_mix.sum(dim=-2, keepdim=True) + hc_sinkhorn_eps)
 
     layer_input = torch.sum(
         pre_mix.unsqueeze(-1) * residual_flat.to(torch.float32), dim=1

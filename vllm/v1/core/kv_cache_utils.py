@@ -1341,6 +1341,17 @@ def _get_kv_cache_config_packed(
     return num_blocks, kv_cache_tensors
 
 
+def _is_draft_kv_layer(layer_name: str) -> bool:
+    """Whether an attention layer belongs to a spec-decode draft model.
+
+    Draft layers run their forward with a block table separate from the base
+    model's, so they must not share a physical KVCacheTensor or a KV cache
+    group with base-model layers. Motif's MTP drafter names its layers
+    ``mtp_block``.
+    """
+    return "mtp_block" in layer_name
+
+
 def get_kv_cache_config_from_groups(
     vllm_config: VllmConfig,
     kv_cache_groups: list[KVCacheGroupSpec],
@@ -1418,6 +1429,48 @@ def get_kv_cache_config_from_groups(
             kv_cache_tensors.append(
                 KVCacheTensor(size=page_size * num_blocks, shared_by=shared_by)
             )
+
+    # Motif MTP spec-decode KV isolation: the draft model's attention layers
+    # ("mtp_block") must never share a physical KVCacheTensor with base-model
+    # layers. The page_size bucketing above can still co-locate a draft layer
+    # with base layers that happen to have the same page_size; the draft runs
+    # its forward with a separate block table, so sharing corrupts the base
+    # layers' KV. Split draft layers into their own tensors.
+    # (Correctness over memory — sharing can be re-optimized later.)
+    if num_blocks > 0 and any(
+        _is_draft_kv_layer(name) for t in kv_cache_tensors for name in t.shared_by
+    ):
+        # Each tensor's size is page_size * num_blocks, so page_size =
+        # size // num_blocks. Isolating a draft layer adds an extra (unshared)
+        # tensor, so recompute num_blocks from the new per-block byte total to
+        # stay within available_memory (otherwise the extra tensor OOMs).
+        split: list[tuple[int, list[str]]] = []  # (page_size_bytes, shared_by)
+        for t in kv_cache_tensors:
+            page_size = t.size // num_blocks
+            base = [n for n in t.shared_by if not _is_draft_kv_layer(n)]
+            draft = [n for n in t.shared_by if _is_draft_kv_layer(n)]
+            if draft and base:
+                split.append((page_size, base))
+                split.extend((page_size, [d]) for d in draft)
+            else:
+                split.append((page_size, t.shared_by))
+        per_block_total = sum(page_size for page_size, _ in split)
+        new_num_blocks = num_blocks
+        if per_block_total > 0:
+            new_num_blocks = may_override_num_blocks(
+                vllm_config, max(0, int(available_memory // per_block_total))
+            )
+        kv_cache_tensors = [
+            KVCacheTensor(size=page_size * new_num_blocks, shared_by=shared_by)
+            for page_size, shared_by in split
+        ]
+        logger.info(
+            "Isolated draft-model KV tensors for MTP spec decode; "
+            "num_blocks %d -> %d",
+            num_blocks,
+            new_num_blocks,
+        )
+        num_blocks = new_num_blocks
 
     return KVCacheConfig(
         num_blocks=num_blocks,

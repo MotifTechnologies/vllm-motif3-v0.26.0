@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from typing import ClassVar
 
 import torch
@@ -65,7 +66,11 @@ class FlashInferMLABackend(MLACommonBackend):
 
     @staticmethod
     def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
-        return [32, 64]
+        # cute-dsl MLA supports page_size 128 (block_num % (128/block_size) == 0
+        # always holds for 128); the [32, 64] cap is a trtllm-gen XQA
+        # constraint. motif3 keeps block_size 128 so that its hybrid
+        # full-attention / SWA KV grouping is unchanged.
+        return [32, 64, 128]
 
     @staticmethod
     def get_kv_cache_stride_order(
@@ -120,6 +125,18 @@ class FlashInferMLABackend(MLACommonBackend):
 
     @classmethod
     def get_required_kv_cache_layout(cls) -> "KVCacheLayoutType | None":
+        # "HND" is applied GLOBALLY by set_kv_cache_layout() and read by every
+        # backend, including the non-MLA layers of a hybrid model. For motif3
+        # that transposes the sliding-window layers' KV stride
+        # (NHD (0,1,2,3) -> HND (0,2,1,3)) and corrupts them, even though the
+        # MLA cache itself is head-agnostic (num_kv_heads=1, so HND == NHD
+        # physically) and the cute-dsl kernel reads it correctly either way.
+        # The "HND" requirement belongs to the trtllm-gen XQA kernel; cute-dsl
+        # does not need it, so leave the global layout at its NHD default (as
+        # CutlassMLABackend does). Set MOTIF_FLASHINFER_MLA_BACKEND to a
+        # non-cute-dsl tactic to restore the upstream requirement.
+        if os.environ.get("MOTIF_FLASHINFER_MLA_BACKEND", "cute-dsl") == "cute-dsl":
+            return None
         return "HND"
 
 
@@ -230,6 +247,12 @@ class FlashInferMLAImpl(MLACommonImpl[MLACommonMetadata]):
             bmm1_scale=self.bmm1_scale,
             bmm2_scale=self.bmm2_scale,
             return_lse=return_lse,
+            # The default trtllm-gen (XQA) kernel rejects motif3's num_heads=80
+            # ("numHeadsQ/numHeadsKv is not supported"); cute-dsl supports
+            # num_heads < 128 by folding and keeps a bf16 KV cache. With
+            # num_spec=1 the verify q_len is 2, below the q_len > 4 gate that
+            # would force the monolithic path.
+            backend=os.environ.get("MOTIF_FLASHINFER_MLA_BACKEND", "cute-dsl"),
         )
         if return_lse:
             o, lse = kernel_out

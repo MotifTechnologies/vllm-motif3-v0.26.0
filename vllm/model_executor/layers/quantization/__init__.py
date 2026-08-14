@@ -18,6 +18,8 @@ QuantizationMethods = Literal[
     "modelopt",
     "modelopt_fp4",
     "modelopt_mxfp8",
+    "modelopt_blockfp8",
+    "modelopt_nvfp4",
     "modelopt_mixed",
     "auto_gptq",
     "gptq",
@@ -130,6 +132,8 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
     from .modelopt import (
         ModelOptFp8Config,
         ModelOptMixedPrecisionConfig,
+        ModelOptBlockFp8Config,
+        ModelOptNvFp4DynamicConfig,
         ModelOptMxFp8Config,
         ModelOptNvFp4Config,
     )
@@ -148,6 +152,8 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
         "modelopt": ModelOptFp8Config,
         "modelopt_fp4": ModelOptNvFp4Config,
         "modelopt_mxfp8": ModelOptMxFp8Config,
+        "modelopt_blockfp8": ModelOptBlockFp8Config,
+        "modelopt_nvfp4": ModelOptNvFp4DynamicConfig,
         "modelopt_mixed": ModelOptMixedPrecisionConfig,
         "auto_gptq": AutoGPTQConfig,
         "gptq": AutoGPTQConfig,

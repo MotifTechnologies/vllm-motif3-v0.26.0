@@ -69,8 +69,17 @@ def mhc_pre_big_fuse_tilelang(
     sinkhorn_repeat: int,
     n_splits: int = 16,
     hc_mult: int = 4,
+    motif_sinkhorn: int = 0,
 ):
-    """Deeply fused kernels, everything other than gemm & sqrsum in mHC pre block."""
+    """Deeply fused kernels, everything other than gemm & sqrsum in mHC pre block.
+
+    motif_sinkhorn=1 selects motif3's training-time sinkhorn convention:
+    exp(clamp(M, +-20)) initialisation (saturating, unlike softmax) with
+    clamp-min(eps) denominators, and comb_mix stored TRANSPOSED so that the
+    consumer's comb^T application yields sinkhorn(M) directly. motif3's weights
+    were trained against this convention, so it is not interchangeable with the
+    default (softmax initialisation, eps added to the denominators).
+    """
     num_tokens = T.dynamic("num_tokens")
     hc_mult3 = hc_mult * (2 + hc_mult)
     hidden_block = math.gcd(512, hidden_size)
@@ -127,34 +136,53 @@ def mhc_pre_big_fuse_tilelang(
             row_sum = T.alloc_fragment(hc_mult, T.float32)
             col_sum = T.alloc_fragment(hc_mult, T.float32)
 
-            # comb = comb.softmax(-1) + eps
-            row_max = T.alloc_fragment(hc_mult, T.float32)
-            T.reduce_max(cm, row_max, dim=1)
-            for j, k in T.Parallel(hc_mult, hc_mult):
-                cm[j, k] = T.exp(cm[j, k] - row_max[j])
-            T.reduce_sum(cm, row_sum, dim=1)
-            for j, k in T.Parallel(hc_mult, hc_mult):
-                cm[j, k] = cm[j, k] / row_sum[j] + hc_sinkhorn_eps
-
-            # comb = comb / (comb.sum(-2) + eps)
-            T.reduce_sum(cm, col_sum, dim=0)
-            for j, k in T.Parallel(hc_mult, hc_mult):
-                cm[j, k] = cm[j, k] / (col_sum[k] + hc_sinkhorn_eps)
-
-            for _ in T.serial(sinkhorn_repeat - 1):
-                # comb = comb / (comb.sum(-1) + eps)
+            if motif_sinkhorn:
+                # motif3 training convention: exp(clamp(M, +-20)) init, then
+                # `sinkhorn_repeat` full (row, col) passes with clamp-min(eps)
+                # denominators.
+                for j, k in T.Parallel(hc_mult, hc_mult):
+                    cm[j, k] = T.exp(T.max(T.min(cm[j, k], 20.0), -20.0))
+                for _ in T.serial(sinkhorn_repeat):
+                    T.reduce_sum(cm, row_sum, dim=1)
+                    for j, k in T.Parallel(hc_mult, hc_mult):
+                        cm[j, k] = cm[j, k] / T.max(row_sum[j], hc_sinkhorn_eps)
+                    T.reduce_sum(cm, col_sum, dim=0)
+                    for j, k in T.Parallel(hc_mult, hc_mult):
+                        cm[j, k] = cm[j, k] / T.max(col_sum[k], hc_sinkhorn_eps)
+            else:
+                # comb = comb.softmax(-1) + eps
+                row_max = T.alloc_fragment(hc_mult, T.float32)
+                T.reduce_max(cm, row_max, dim=1)
+                for j, k in T.Parallel(hc_mult, hc_mult):
+                    cm[j, k] = T.exp(cm[j, k] - row_max[j])
                 T.reduce_sum(cm, row_sum, dim=1)
                 for j, k in T.Parallel(hc_mult, hc_mult):
-                    cm[j, k] = cm[j, k] / (row_sum[j] + hc_sinkhorn_eps)
+                    cm[j, k] = cm[j, k] / row_sum[j] + hc_sinkhorn_eps
 
                 # comb = comb / (comb.sum(-2) + eps)
                 T.reduce_sum(cm, col_sum, dim=0)
                 for j, k in T.Parallel(hc_mult, hc_mult):
                     cm[j, k] = cm[j, k] / (col_sum[k] + hc_sinkhorn_eps)
 
-            # save comb_mix to global memory
-            for j, k in T.Parallel(hc_mult, hc_mult):
-                comb_mix[i, j * hc_mult + k] = cm[j, k]
+                for _ in T.serial(sinkhorn_repeat - 1):
+                    # comb = comb / (comb.sum(-1) + eps)
+                    T.reduce_sum(cm, row_sum, dim=1)
+                    for j, k in T.Parallel(hc_mult, hc_mult):
+                        cm[j, k] = cm[j, k] / (row_sum[j] + hc_sinkhorn_eps)
+
+                    # comb = comb / (comb.sum(-2) + eps)
+                    T.reduce_sum(cm, col_sum, dim=0)
+                    for j, k in T.Parallel(hc_mult, hc_mult):
+                        cm[j, k] = cm[j, k] / (col_sum[k] + hc_sinkhorn_eps)
+
+            # save comb_mix to global memory (motif: transposed, so applying
+            # comb^T downstream yields sinkhorn(M))
+            if motif_sinkhorn:
+                for j, k in T.Parallel(hc_mult, hc_mult):
+                    comb_mix[i, k * hc_mult + j] = cm[j, k]
+            else:
+                for j, k in T.Parallel(hc_mult, hc_mult):
+                    comb_mix[i, j * hc_mult + k] = cm[j, k]
         else:
             ##################################################################
             # _pre_split_mixes_fwd (pre)
