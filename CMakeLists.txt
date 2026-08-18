@@ -972,7 +972,16 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
       "csrc/libtorch_stable/quantization/fp4/nvfp4_experts_quant.cu"
       "csrc/libtorch_stable/quantization/fp4/nvfp4_scaled_mm_sm120_kernels.cu"
       "csrc/libtorch_stable/quantization/fp4/nvfp4_blockwise_moe_kernel.cu"
-      "csrc/libtorch_stable/nvfp4_kv_cache_kernels.cu")
+      "csrc/libtorch_stable/nvfp4_kv_cache_kernels.cu"
+      # LOCAL PATCH (2026-08-18): motif3's grouped PolyNorm + NVFP4 quant kernel
+      # shipped only in FP4_SM100_SRCS below, so an SM120-only build compiled it
+      # out and every worker died at startup with
+      #   "No compiled grouped_poly_norm_nvfp4_quant kernel".
+      # The kernel carries no arch guards (no tcgen05/wgmma/__CUDA_ARCH__) and
+      # its only fp4 header, quantization/fp4/nvfp4_utils.cuh, is equally
+      # arch-neutral and already used by nvfp4_quant_kernels.cu and
+      # nvfp4_experts_quant.cu in THIS list -- so it builds for SM12x too.
+      "csrc/libtorch_stable/grouped_poly_norm_nvfp4_quant_kernel.cu")
     set_gencode_flags_for_srcs(
       SRCS "${FP4_SM120_SRCS}"
       CUDA_ARCHS "${FP4_SM120_ARCHS}")
