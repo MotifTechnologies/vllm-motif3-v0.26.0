@@ -13,6 +13,7 @@ import torch.nn.functional as F
 
 from vllm.model_executor.layers.attention import Attention, MLAAttention
 from vllm.v1.attention.backends.flash_attn_diffkv import FlashAttentionDiffKVBackend
+from vllm.v1.attention.backends.triton_attn_diffkv import TritonAttentionDiffKVBackend
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
 from vllm.distributed import (
@@ -639,8 +640,32 @@ class MotifGDLAttention(nn.Module):
             # default FA backend assumes K=V dim, which mis-reshapes the cache.
             # mimo_v2_flash.py uses the same pattern.
             if self.v_head_dim != self.head_dim:
-                FlashAttentionDiffKVBackend.set_head_size_v(self.v_head_dim)
-                attn_backend = FlashAttentionDiffKVBackend
+                # LOCAL PATCH (2026-08-18): the flash diff-KV backend needs FA3,
+                # which does not exist for SM120 (RTX PRO 6000). vLLM then falls
+                # back to FA2, whose varlen_fwd assumes K and V share head_size,
+                # and every SWA layer dies with
+                #   "v must have shape (num_blocks, page_block_size,
+                #    num_heads_k, head_size)".
+                # triton_attn_diffkv exposes the same interface (set_head_size_v,
+                # same head_size + head_size_v cache layout) with no FA3
+                # dependency, so select it when FA3 is unavailable. Override
+                # explicitly with MOTIF_DIFFKV_BACKEND=flash|triton.
+                _diffkv = os.environ.get("MOTIF_DIFFKV_BACKEND", "auto").lower()
+                if _diffkv == "auto":
+                    from vllm.v1.attention.backends.fa_utils import (
+                        is_fa_version_supported,
+                    )
+
+                    try:
+                        _diffkv = "flash" if is_fa_version_supported(3) else "triton"
+                    except Exception:
+                        _diffkv = "triton"
+                if _diffkv == "flash":
+                    FlashAttentionDiffKVBackend.set_head_size_v(self.v_head_dim)
+                    attn_backend = FlashAttentionDiffKVBackend
+                else:
+                    TritonAttentionDiffKVBackend.set_head_size_v(self.v_head_dim)
+                    attn_backend = TritonAttentionDiffKVBackend
             else:
                 attn_backend = None
 
